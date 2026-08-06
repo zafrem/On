@@ -1,23 +1,21 @@
 # On — System Requirements Specification
 
-**Version** v0.3
+**Version** v0.4
 **Date** 2026-08-06
-**Previous** v0.2
+**Previous** v0.3
 
 ---
 
-## 0. Changes from v0.2
+## 0. Changes from v0.3
 
 | Area | Change |
 |---|---|
-| §4.3 | **Commitment management screen separated** from tasks. Weekly grid editor added |
-| §3.9 | **PushSubscription** entity added |
-| §5.10 | **Notification requirements** added. Three-tier fallback |
-| §6.7 | Notification scheduler and external cron configuration added |
-| §7 | **PWA requirements** added |
-| §10 | **Design system** added. Brand and functional colors defined |
-| §12 | Google Calendar integration reduced from continuous sync to **one-time import** |
-| §12.2 | **Native extension path** added. Widgets and Live Activities scoped to v2 |
+| §3.0 | **User** and **Profile** entities added. Profile holds timezone and default wake/sleep |
+| §3.2 | `Block.startMin` **upper bound defined**. May exceed 1440 on a day extending past midnight |
+| §3.5 | `ActualEntry` **date-attribution rule** added. Attributed by wake→sleep window (resolves Q-04) |
+| §5.8 | `Committed` redefined as the **union** of commitment intervals, not their sum |
+| §6.3 | Non-overlap DB defense **scoped** to block-vs-block. Block-vs-commitment is API-only |
+| §11 | Q-03, Q-04, Q-05 **resolved**. Three new product questions recorded |
 
 ---
 
@@ -78,6 +76,39 @@ On's core value lies in its **constraints**, not in feature richness. The five c
 
 ## 3. Domain Model
 
+### 3.0 User and Profile
+
+Every entity carries `userId`. This section defines what it points to and where profile-level defaults live.
+
+```
+User {
+  id        : UUID          // PK. Referenced by every entity's userId
+  email     : String        // unique, login identity
+  createdAt : DateTime
+  deletedAt : DateTime | null
+}
+```
+
+```
+Profile {
+  userId            : UUID   // PK. 1:1 with User
+  timezone          : String // IANA tz, e.g. "Asia/Seoul". Single tz per v1 (NFR-05)
+  defaultWakeMin    : Int    // minutes from midnight
+  defaultSleepMin   : Int    // 1440+ when past midnight, mirrors DayMarker
+  slackAllowanceMin : Int    // default 30. Constant until Q-02 is decided
+  createdAt         : DateTime
+  updatedAt         : DateTime
+}
+```
+
+**Rules**
+
+- One `Profile` per `User`, created at signup with system defaults.
+- `defaultWakeMin` / `defaultSleepMin` seed every new `DayMarker` (§3.4). A per-date override does not alter the profile.
+- `timezone` is the single source of truth for all minute-from-midnight conversions (NFR-05, NFR-06).
+- **Multi-user in v1 is account separation only.** `userId` is the sole tenant key; RLS (§6.3) isolates on it. No cross-user sharing schema is introduced (Q-05).
+- `slackAllowanceMin` is modeled here so Q-02 resolves without a schema change. Until then the API treats it as a constant 30 and exposes no editor.
+
 ### 3.1 Task
 
 ```
@@ -121,7 +152,9 @@ Block {
   userId      : UUID
   taskId      : UUID
   date        : Date
-  startMin    : Int          // minutes from midnight, multiple of 5
+  startMin    : Int          // minutes from the block's date midnight, multiple of 5.
+                             // May exceed 1440 when the waking day extends past midnight.
+                             // Bound: startMin + durationMin <= plannedSleepMin of the date (R-08).
   durationMin : Int          // 5-60
   createdAt   : DateTime
   updatedAt   : DateTime
@@ -131,6 +164,7 @@ Block {
 
 - A single task may be split into multiple blocks on the same day.
 - A block's `durationMin` is adjustable independently of the task's `estimateMin`.
+- A block belongs to the `date` whose wake→sleep window contains its start, on the same continuous axis as `DayMarker`. A block starting at 00:30 on a day that sleeps at 01:30 has `date` = the *previous* calendar date and `startMin` = 1470.
 
 ### 3.3 Commitment
 
@@ -229,6 +263,12 @@ ActualEntry {
   deletedAt    : DateTime | null
 }
 ```
+
+**Date attribution**
+
+- An entry is attributed to the `date` whose **wake→sleep window** contains its `startMin`, identical to the block rule (§3.2) — not to the wall-clock calendar date. An entry logged at 00:45 on a day that sleeps at 01:30 is attributed to the prior date with `startMin` = 1485.
+- Attribution is resolved at write time from the active `DayMarker`, so reads filter on `date` alone.
+- If no `DayMarker` exists yet for the containing window, attribute to the calendar date of the start and let FR-D05 reconcile on confirmation.
 
 ### 3.6 UnplacedItem
 
@@ -479,11 +519,13 @@ Let `D` be the dropped block occupying `[s, e)`:
 - **FR-B01** The system computes available time for each date.
   ```
   Day span      = sleep time - wake time
-  Committed     = sum of commitments that day
+  Committed     = total length of the UNION of commitment intervals that day
+                  (overlapping commitments counted once)
   Available     = day span - committed
-  Placed        = sum of placed blocks
+  Placed        = sum of placed blocks        // blocks never overlap (R-01), so sum is exact
   Remaining     = available - placed
   ```
+  `Committed` measures occupied wall-clock time, so overlapping commitments (§3.3) collapse into a single span. The union is computed over the query-time-expanded commitment instances, after applying `CommitmentException`.
 - **FR-B02** Placed time against available time is shown as a budget bar, distinguishing committed, placed, and remaining.
 - **FR-B03** Remaining time falling below zero triggers a warning but is not blocked. Only exceeding the sleep time is blocked, under R-08.
 - **FR-B04** If the three important tasks together exceed available time, a warning is shown before placement.
@@ -574,8 +616,9 @@ External scheduler → (every minute) → /api/cron/notifications → Web Push
 ### 6.3 Defense Layers
 
 - **RLS** — `userId`-based policies on every table.
-- **EXCLUDE constraint** — Plan-lane non-overlap (R-01) enforced with `EXCLUDE USING gist`. The database holds even if the API has a defect.
-- **CHECK constraints** — Block `durationMin BETWEEN 5 AND 60`, `startMin % 5 = 0`.
+- **EXCLUDE constraint** — Block-vs-**block** non-overlap (the block half of R-01) enforced with `EXCLUDE USING gist` over `(userId, date, int4range(startMin, startMin + durationMin))`. Because `startMin` may exceed 1440 (§3.2), the range must not be modulo-1440. The database holds even if the API has a defect.
+- **Block-vs-commitment** non-overlap (the other half of R-01, and FR-C07) is enforced **only** by API validation during placement, because recurring commitments are expanded at query time (§3.3) and are not rows the database can constrain. This is an accepted, explicit limitation: all writes go through the API layer (§6.2), so a bypassing write is not reachable in normal operation.
+- **CHECK constraints** — Block `durationMin BETWEEN 5 AND 60`, `startMin >= 0 AND startMin % 5 = 0`. No upper-bound CHECK against `plannedSleepMin` (it lives in another row); that bound is enforced by the API under R-08.
 - The three-important-tasks limit is handled in v1 by API validation under transaction isolation.
 
 ### 6.4 Key Endpoints
@@ -690,15 +733,18 @@ External scheduler → (every minute) → /api/cron/notifications → Web Push
 
 ## 11. Open Issues
 
-| ID | Issue | Decide by |
+| ID | Issue | Status |
 |---|---|---|
-| Q-01 | The three-important-tasks limit is placement-based, so a task completed without being placed is not counted. Is this loophole acceptable? | Before v1 release |
-| Q-02 | Should the slack allowance of 30 minutes be user-configurable? A fixed value better matches the product philosophy | Before v1 release |
-| Q-03 | Should recurrence expansion happen server-side or client-side? | Before implementation |
-| Q-04 | Date attribution for actual entries when sleep time passes midnight. Cutting at wake time matches user intuition but complicates queries | Before schema freeze |
-| Q-05 | Is multi-user just account separation, or should the schema leave room for family sharing (e.g. a child's timetable)? | Before v1 schema freeze |
-| Q-06 | External scheduling service versus Vercel Pro for the notification scheduler | Before deployment |
-| Q-07 | Frontend framework and migration tooling selection | Before implementation |
+| Q-01 | The three-important-tasks limit is placement-based, so a task completed without being placed is not counted. Is this loophole acceptable? | Open — before v1 release |
+| Q-02 | Should the slack allowance of 30 minutes be user-configurable? A fixed value better matches the product philosophy | Open — schema forward-compatible via `Profile.slackAllowanceMin` (§3.0) |
+| Q-03 | Recurrence expansion server-side or client-side? | **Resolved: server-side.** FR-C09 caps expansion to one year; §6 centralizes enforcement. Instances ship in `GET /api/days/{date}` |
+| Q-04 | Date attribution for actual entries when sleep passes midnight | **Resolved: attribute by wake→sleep window** (§3.2, §3.5), on one continuous axis |
+| Q-05 | Multi-user: account separation, or leave room for family sharing? | **Resolved: account separation only for v1.** Sharing is additive in v2 (a grant table over existing rows), so deferring costs nothing |
+| Q-06 | External scheduling service versus Vercel Pro for the notification scheduler | Open — before deployment |
+| Q-07 | Frontend framework and migration tooling selection | Open — before implementation |
+| Q-08 | "This and following" reschedule (FR-C04) has no data model — `CommitmentException` is per-date only. Drop it from v1, or implement as a commitment split (`validUntil` + new row)? | Open — before implementing commitments |
+| Q-09 | `actual/planned` grain for a task split across multiple blocks (FR-N01). Proposed: task-day grain (sum of actuals ÷ sum of planned blocks for the date) | Open — before analytics schema |
+| Q-10 | What counts as "completion" for session decrement (FR-C05)? Proposed: an `ActualEntry` against the instance, deduplicated per instance | Open — before implementing commitments |
 
 ---
 
